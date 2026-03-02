@@ -60,21 +60,17 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
 
   useEffect(() => { pageDataRef.current = pageData; }, [pageData]);
 
-  const getPos = useCallback((e: React.MouseEvent | React.TouchEvent | MouseEvent | TouchEvent): Point => {
+  const getPos = useCallback((e: React.PointerEvent | PointerEvent): Point => {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
-    let clientX: number, clientY: number, pressure = 0.5;
-    if ('touches' in e) {
-      const touch = (e as TouchEvent).touches[0] || (e as TouchEvent).changedTouches[0];
-      clientX = touch.clientX;
-      clientY = touch.clientY;
-      if ('force' in touch) pressure = Math.max(0.1, (touch as any).force || 0.5);
-    } else {
-      clientX = (e as MouseEvent).clientX;
-      clientY = (e as MouseEvent).clientY;
-      pressure = 0.5;
-    }
-    return { x: (clientX - rect.left) / zoom, y: (clientY - rect.top) / zoom, pressure };
+    // PointerEvent works for mouse, touch AND stylus (pen)
+    // e.pressure: 0.5 for mouse/touch (no hardware), real value for stylus
+    const pressure = e.pressure > 0 ? e.pressure : 0.5;
+    return {
+      x: (e.clientX - rect.left) / zoom,
+      y: (e.clientY - rect.top) / zoom,
+      pressure,
+    };
   }, [zoom]);
 
   // Load PDF image
@@ -349,8 +345,17 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
     return null;
   };
 
+  // Track which pointer we're following (ignore secondary fingers)
+  const activePointerIdRef = useRef<number | null>(null);
+
   /* ─── POINTER DOWN ─────────────────────────────────────────────── */
-  const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
+  const handlePointerDown = (e: React.PointerEvent) => {
+    // Only track the first pointer (pen or first finger), ignore additional touches
+    if (activePointerIdRef.current !== null && e.pointerType !== 'pen') return;
+    // For pen (stylus) always update to latest pointer
+    activePointerIdRef.current = e.pointerId;
+    // Capture pointer so move/up fire even if stylus leaves canvas briefly
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     e.preventDefault();
     const pos = getPos(e);
     const pd = pageDataRef.current;
@@ -488,7 +493,9 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
   };
 
   /* ─── POINTER MOVE ─────────────────────────────────────────────── */
-  const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
+  const handlePointerMove = (e: React.PointerEvent) => {
+    // Ignore events from non-tracked pointers
+    if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) return;
     if (!isDrawingRef.current) return;
     e.preventDefault();
     const pos = getPos(e);
@@ -575,7 +582,22 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
     }
 
     if (activeTool === 'pen' || activeTool === 'highlighter') {
-      currentStrokeRef.current.push(pos);
+      // Use coalesced events for stylus — gives sub-frame accuracy
+      const coalescedEvents = (e.nativeEvent as PointerEvent).getCoalescedEvents?.() || [];
+      if (coalescedEvents.length > 0) {
+        coalescedEvents.forEach(ce => {
+          const canvas = canvasRef.current!;
+          const rect = canvas.getBoundingClientRect();
+          const pressure = ce.pressure > 0 ? ce.pressure : 0.5;
+          currentStrokeRef.current.push({
+            x: (ce.clientX - rect.left) / zoom,
+            y: (ce.clientY - rect.top) / zoom,
+            pressure,
+          });
+        });
+      } else {
+        currentStrokeRef.current.push(pos);
+      }
       const overlay = overlayCanvasRef.current;
       if (overlay) {
         const ctx = overlay.getContext('2d')!;
@@ -623,7 +645,10 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
   };
 
   /* ─── POINTER UP ───────────────────────────────────────────────── */
-  const handlePointerUp = (e: React.MouseEvent | React.TouchEvent) => {
+  const handlePointerUp = (e: React.PointerEvent) => {
+    // Ignore events from non-tracked pointers
+    if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) return;
+    activePointerIdRef.current = null;
     e.preventDefault();
 
     if (resizingRef.current) {
@@ -697,7 +722,7 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
   };
 
   /* ─── double-click on text box → open editor ──────────────────── */
-  const handleDoubleClick = (e: React.MouseEvent) => {
+  const handleDoubleClick = (e: React.PointerEvent) => {
     const pos = getPos(e);
     const pd = pageDataRef.current;
     if (activeTool === 'text' || activeTool === 'select') {
@@ -778,15 +803,17 @@ const DrawingCanvas = forwardRef<CanvasHandle, Props>((
       <canvas ref={overlayCanvasRef} width={canvasWidth} height={canvasHeight}
         style={{ width: canvasWidth * zoom, height: canvasHeight * zoom, position: 'absolute', top: 0, left: 0, pointerEvents: 'none' }} />
       <div
-        style={{ width: canvasWidth * zoom, height: canvasHeight * zoom, position: 'absolute', top: 0, left: 0, cursor: getCursor(), touchAction: 'none' }}
-        onMouseDown={handlePointerDown}
-        onMouseMove={handlePointerMove}
-        onMouseUp={handlePointerUp}
-        onMouseLeave={e => { if (isDrawingRef.current) handlePointerUp(e); }}
-        onDoubleClick={handleDoubleClick}
-        onTouchStart={handlePointerDown}
-        onTouchMove={handlePointerMove}
-        onTouchEnd={handlePointerUp}
+        style={{ width: canvasWidth * zoom, height: canvasHeight * zoom, position: 'absolute', top: 0, left: 0, cursor: getCursor(), touchAction: 'none', userSelect: 'none' }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onPointerLeave={e => { if (isDrawingRef.current) handlePointerUp(e); }}
+        onDoubleClick={e => {
+          // handleDoubleClick expects PointerEvent-like, cast MouseEvent since it has same coords
+          const fakePtr = { ...e, pressure: 0.5, pointerId: 0 } as unknown as React.PointerEvent;
+          handleDoubleClick(fakePtr);
+        }}
       />
       {/* pdfselect: invisible selectable text overlay handled by parent via PdfTextLayer */}
       {/* Inline textarea for text editing */}

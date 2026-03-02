@@ -511,8 +511,15 @@ function App() {
 
       {/* Main content row: canvas + sticker panel */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Canvas area — scrollable for PDF multi-page */}
-        <div className="flex-1 overflow-auto bg-gradient-to-br from-gray-200 to-gray-300">
+        {/* Canvas area — scrollable for PDF multi-page
+            touch-action: pan-y when on a scroll/pan tool, none when drawing
+            so stylus/finger draws instead of scrolling */}
+        <div
+          className="flex-1 overflow-auto bg-gradient-to-br from-gray-200 to-gray-300"
+          style={{
+            touchAction: (activeTool === 'pan' || activeTool === 'pdfselect') ? 'pan-y' : 'none',
+          }}
+        >
           <div className="flex flex-col items-center py-6 gap-6">
             {isPdfMultiPage ? (
               Array.from({ length: activeFile.totalPages }, (_, pageIdx) => {

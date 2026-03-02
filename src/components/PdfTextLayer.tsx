@@ -92,7 +92,7 @@ const PdfTextLayer: React.FC<Props> = ({
       return;
     }
 
-    const handleMouseUp = (e: MouseEvent) => {
+    const handleSelectionEnd = (e: Event) => {
       // Small delay so the selection is committed
       setTimeout(() => {
         const selection = window.getSelection();
@@ -125,7 +125,7 @@ const PdfTextLayer: React.FC<Props> = ({
           maxY = Math.max(maxY, rb);
         }
 
-        // Popup position: just above/below selection in viewport coords
+        // Popup position: just below the last selection rect
         const lastRect = rects[rects.length - 1];
         const popupX = lastRect.left - containerRect.left;
         const popupY = lastRect.bottom - containerRect.top + 6;
@@ -137,18 +137,23 @@ const PdfTextLayer: React.FC<Props> = ({
           region: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
         });
 
-        e.stopPropagation();
+        (e as MouseEvent).stopPropagation?.();
       }, 10);
     };
 
     const container = containerRef.current;
-    container?.addEventListener('mouseup', handleMouseUp);
-    return () => container?.removeEventListener('mouseup', handleMouseUp);
+    // Listen for both mouse and pointer (stylus/touch) up events
+    container?.addEventListener('mouseup', handleSelectionEnd);
+    container?.addEventListener('pointerup', handleSelectionEnd);
+    return () => {
+      container?.removeEventListener('mouseup', handleSelectionEnd);
+      container?.removeEventListener('pointerup', handleSelectionEnd);
+    };
   }, [active, zoom]);
 
   // Close popup if clicking outside
   useEffect(() => {
-    const handleClick = (e: MouseEvent) => {
+    const handleClick = (e: Event) => {
       if (!popup) return;
       const container = containerRef.current;
       if (container && !container.contains(e.target as Node)) {
@@ -156,7 +161,11 @@ const PdfTextLayer: React.FC<Props> = ({
       }
     };
     document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
+    document.addEventListener('pointerdown', handleClick);
+    return () => {
+      document.removeEventListener('mousedown', handleClick);
+      document.removeEventListener('pointerdown', handleClick);
+    };
   }, [popup]);
 
   if (items.length === 0) return null;

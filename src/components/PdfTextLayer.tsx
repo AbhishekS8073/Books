@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { StickyNote, X } from 'lucide-react';
 
 interface Props {
   pdfDataUrl: string;
@@ -6,21 +7,32 @@ interface Props {
   canvasWidth: number;
   canvasHeight: number;
   zoom: number;
-  active: boolean; // only interactive when pdfselect tool is active
+  active: boolean;
+  onAddStickerFromSelection?: (text: string, region: { x: number; y: number; w: number; h: number }) => void;
 }
 
 interface TextItem {
   str: string;
-  transform: number[]; // [a, b, c, d, e, f] — PDF transform matrix
+  transform: number[];
   width: number;
   height: number;
   fontName: string;
 }
 
-const PdfTextLayer: React.FC<Props> = ({ pdfDataUrl, pageIndex, canvasWidth, canvasHeight, zoom, active }) => {
+interface Popup {
+  x: number; // px in viewport
+  y: number;
+  text: string;
+  region: { x: number; y: number; w: number; h: number };
+}
+
+const PdfTextLayer: React.FC<Props> = ({
+  pdfDataUrl, pageIndex, canvasWidth, canvasHeight, zoom, active, onAddStickerFromSelection
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [items, setItems] = useState<{ text: string; x: number; y: number; w: number; h: number; fs: number }[]>([]);
   const loadedRef = useRef<string>('');
+  const [popup, setPopup] = useState<Popup | null>(null);
 
   useEffect(() => {
     const key = `${pdfDataUrl.slice(0, 40)}_${pageIndex}`;
@@ -43,12 +55,7 @@ const PdfTextLayer: React.FC<Props> = ({ pdfDataUrl, pageIndex, canvasWidth, can
 
         const page = await pdf.getPage(pageIndex + 1);
         const viewport = page.getViewport({ scale: 1 });
-
-        // Compute same scale used in renderPdfPages in App.tsx
-        const scaleX = canvasWidth / viewport.width;
-        const scaleY = canvasHeight / viewport.height;
-        const scale = Math.min(scaleX, scaleY);
-
+        const scale = Math.min(canvasWidth / viewport.width, canvasHeight / viewport.height);
         const scaledVP = page.getViewport({ scale });
         const offsetX = (canvasWidth - scaledVP.width) / 2;
         const offsetY = (canvasHeight - scaledVP.height) / 2;
@@ -57,19 +64,15 @@ const PdfTextLayer: React.FC<Props> = ({ pdfDataUrl, pageIndex, canvasWidth, can
         const mapped = (content.items as TextItem[])
           .filter(item => item.str && item.str.trim())
           .map(item => {
-            // PDF matrix: [a, b, c, d, e, f]
-            // e = x, f = y in PDF space (origin bottom-left)
             const [, , , d, e, f] = item.transform;
             const fontSize = Math.abs(d) * scale;
-            // Convert PDF y (bottom-left origin) to canvas y (top-left origin)
             const canvasX = e * scale + offsetX;
             const canvasY = (viewport.height - f) * scale + offsetY - fontSize;
-            const textWidth = item.width * scale;
             return {
               text: item.str,
               x: canvasX,
               y: canvasY,
-              w: textWidth,
+              w: item.width * scale,
               h: fontSize * 1.2,
               fs: fontSize,
             };
@@ -81,6 +84,80 @@ const PdfTextLayer: React.FC<Props> = ({ pdfDataUrl, pageIndex, canvasWidth, can
       }
     })();
   }, [pdfDataUrl, pageIndex, canvasWidth, canvasHeight]);
+
+  // Listen for mouseup to detect text selection
+  useEffect(() => {
+    if (!active) {
+      setPopup(null);
+      return;
+    }
+
+    const handleMouseUp = (e: MouseEvent) => {
+      // Small delay so the selection is committed
+      setTimeout(() => {
+        const selection = window.getSelection();
+        if (!selection || selection.isCollapsed) {
+          // Don't clear popup immediately — user might be clicking the popup button
+          return;
+        }
+        const selectedText = selection.toString().trim();
+        if (!selectedText) return;
+
+        // Get bounding rect of the selection relative to the container
+        const range = selection.getRangeAt(0);
+        const rects = range.getClientRects();
+        if (!rects.length) return;
+
+        const container = containerRef.current;
+        if (!container) return;
+        const containerRect = container.getBoundingClientRect();
+
+        // Compute bounding box of all rects relative to canvas coords (unzoomed)
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const r of Array.from(rects)) {
+          const rx = (r.left - containerRect.left) / zoom;
+          const ry = (r.top - containerRect.top) / zoom;
+          const rr = (r.right - containerRect.left) / zoom;
+          const rb = (r.bottom - containerRect.top) / zoom;
+          minX = Math.min(minX, rx);
+          minY = Math.min(minY, ry);
+          maxX = Math.max(maxX, rr);
+          maxY = Math.max(maxY, rb);
+        }
+
+        // Popup position: just above/below selection in viewport coords
+        const lastRect = rects[rects.length - 1];
+        const popupX = lastRect.left - containerRect.left;
+        const popupY = lastRect.bottom - containerRect.top + 6;
+
+        setPopup({
+          x: popupX,
+          y: popupY,
+          text: selectedText,
+          region: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+        });
+
+        e.stopPropagation();
+      }, 10);
+    };
+
+    const container = containerRef.current;
+    container?.addEventListener('mouseup', handleMouseUp);
+    return () => container?.removeEventListener('mouseup', handleMouseUp);
+  }, [active, zoom]);
+
+  // Close popup if clicking outside
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (!popup) return;
+      const container = containerRef.current;
+      if (container && !container.contains(e.target as Node)) {
+        setPopup(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [popup]);
 
   if (items.length === 0) return null;
 
@@ -95,10 +172,11 @@ const PdfTextLayer: React.FC<Props> = ({ pdfDataUrl, pageIndex, canvasWidth, can
         height: canvasHeight * zoom,
         pointerEvents: active ? 'auto' : 'none',
         userSelect: active ? 'text' : 'none',
-        overflow: 'hidden',
+        overflow: 'visible',
         zIndex: 10,
       }}
     >
+      {/* Invisible but selectable text spans */}
       {items.map((item, i) => (
         <span
           key={i}
@@ -110,16 +188,74 @@ const PdfTextLayer: React.FC<Props> = ({ pdfDataUrl, pageIndex, canvasWidth, can
             fontSize: item.fs * zoom,
             lineHeight: 1.2,
             fontFamily: 'sans-serif',
-            color: active ? 'rgba(0,0,100,0.01)' : 'transparent',
+            color: active ? 'rgba(0,0,100,0.02)' : 'transparent',
             whiteSpace: 'pre',
             cursor: active ? 'text' : 'default',
-            // slight background on hover when active so user can see selectable zones
             background: 'transparent',
           }}
         >
           {item.text}
         </span>
       ))}
+
+      {/* Selection popup */}
+      {popup && active && (
+        <div
+          style={{
+            position: 'absolute',
+            left: Math.min(popup.x, canvasWidth * zoom - 220),
+            top: popup.y,
+            zIndex: 100,
+            pointerEvents: 'auto',
+            userSelect: 'none',
+          }}
+          onMouseDown={e => e.stopPropagation()}
+        >
+          <div className="flex items-center gap-1 bg-gray-900 text-white rounded-xl shadow-2xl px-2 py-1.5 text-xs">
+            {/* Preview of selected text */}
+            <span className="max-w-[120px] truncate text-gray-300 text-[10px] italic mr-1">
+              "{popup.text.slice(0, 40)}{popup.text.length > 40 ? '…' : ''}"
+            </span>
+            <button
+              className="flex items-center gap-1 bg-yellow-400 hover:bg-yellow-300 text-gray-900 font-semibold px-2.5 py-1 rounded-lg text-[11px] transition-colors whitespace-nowrap"
+              onMouseDown={e => {
+                e.preventDefault();
+                e.stopPropagation();
+                onAddStickerFromSelection?.(popup.text, popup.region);
+                window.getSelection()?.removeAllRanges();
+                setPopup(null);
+              }}
+            >
+              <StickyNote size={11} />
+              Add Sticker
+            </button>
+            <button
+              className="p-0.5 rounded hover:bg-white/20 text-gray-400 ml-0.5"
+              onMouseDown={e => {
+                e.preventDefault();
+                e.stopPropagation();
+                window.getSelection()?.removeAllRanges();
+                setPopup(null);
+              }}
+            >
+              <X size={12} />
+            </button>
+          </div>
+          {/* Arrow up */}
+          <div
+            style={{
+              position: 'absolute',
+              top: -6,
+              left: 16,
+              width: 0,
+              height: 0,
+              borderLeft: '6px solid transparent',
+              borderRight: '6px solid transparent',
+              borderBottom: '6px solid #111827',
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 };

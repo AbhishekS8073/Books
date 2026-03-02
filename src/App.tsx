@@ -1,16 +1,18 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { ProjectFile, PageData, ToolType, EraserMode, PenStyle, SavedPen } from './types';
+import { ProjectFile, PageData, StickerNote, ToolType, EraserMode, PenStyle, SavedPen } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import DocumentsPage from './components/DocumentsPage';
 import Toolbar from './components/Toolbar';
 import DrawingCanvas, { CanvasHandle } from './components/DrawingCanvas';
 import { ArrowLeft } from 'lucide-react';
 import PdfTextLayer from './components/PdfTextLayer';
+import StickerNotesPanel from './components/StickerNotesPanel';
+import LazyPdfPage from './components/LazyPdfPage';
 
 const CANVAS_W = 1200;
 const CANVAS_H = 900;
 
-const emptyPage = (): PageData => ({ strokes: [], textBoxes: [], images: [] });
+const emptyPage = (): PageData => ({ strokes: [], textBoxes: [], images: [], stickerNotes: [] });
 
 function App() {
   const [files, setFiles] = useState<ProjectFile[]>(() => {
@@ -113,10 +115,12 @@ function App() {
     setRedoStack([]);
   };
 
+  /** Chunked PDF loading: only reads page count up-front; individual pages render lazily via LazyPdfPage */
   const renderPdfPages = async (fileId: string, dataUrl: string) => {
     try {
       const pdfjsLib = await import('pdfjs-dist');
-      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js`;
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
       const byteString = atob(dataUrl.split(',')[1]);
       const ab = new ArrayBuffer(byteString.length);
@@ -124,49 +128,107 @@ function App() {
       for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
 
       const pdf = await pdfjsLib.getDocument({ data: ia }).promise;
-      const images: string[] = [];
+      const numPages = pdf.numPages;
 
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 1.5 });
-        const canvas = document.createElement('canvas');
-        canvas.width = CANVAS_W;
-        canvas.height = CANVAS_H;
-        const ctx = canvas.getContext('2d')!;
-        // Scale to fit canvas
-        const scaleX = CANVAS_W / viewport.width;
-        const scaleY = CANVAS_H / viewport.height;
-        const scale = Math.min(scaleX, scaleY);
-        const scaledViewport = page.getViewport({ scale: 1.5 * scale });
-        canvas.width = CANVAS_W;
-        canvas.height = CANVAS_H;
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-        // Center the PDF on canvas
-        const offsetX = (CANVAS_W - scaledViewport.width) / 2;
-        const offsetY = (CANVAS_H - scaledViewport.height) / 2;
-        ctx.translate(offsetX, offsetY);
-        await page.render({ canvasContext: ctx, viewport: scaledViewport }).promise;
-        images.push(canvas.toDataURL('image/jpeg', 0.85));
-      }
-
-      setPdfPageImages(prev => new Map(prev).set(fileId, images));
+      // Initialise image map with nulls — LazyPdfPage will fill them in
+      setPdfPageImages(prev => {
+        const existing = prev.get(fileId) || [];
+        const arr: string[] = Array.from({ length: numPages }, (_, i) => existing[i] || '');
+        return new Map(prev).set(fileId, arr);
+      });
 
       setFiles(prev => prev.map(f => {
-        if (f.id === fileId) {
-          const pages = f.pages.length >= pdf.numPages
-            ? f.pages
-            : Array.from({ length: pdf.numPages }, (_, i) => f.pages[i] || emptyPage());
-          return { ...f, totalPages: pdf.numPages, pages };
-        }
-        return f;
+        if (f.id !== fileId) return f;
+        const pages = Array.from({ length: numPages }, (_, i) =>
+          f.pages[i] ? { ...emptyPage(), ...f.pages[i] } : emptyPage()
+        );
+        return { ...f, totalPages: numPages, pages };
       }));
-      showStatus('PDF loaded successfully!');
+
+      showStatus(`PDF ready — ${numPages} page${numPages > 1 ? 's' : ''} (loading lazily)`);
     } catch (err) {
-      console.error('PDF render error:', err);
+      console.error('PDF init error:', err);
       showStatus('Error loading PDF. Please try again.');
     }
   };
+
+  /** Called by LazyPdfPage when a single page has been rendered */
+  const handlePageImageReady = useCallback((fileId: string, pageIndex: number, dataUrl: string) => {
+    setPdfPageImages(prev => {
+      const arr = [...(prev.get(fileId) || [])];
+      arr[pageIndex] = dataUrl;
+      return new Map(prev).set(fileId, arr);
+    });
+  }, []);
+
+  /** Sticker note helpers — operate on the current page's stickerNotes array */
+  const handleStickerNotesChange = useCallback((notes: StickerNote[]) => {
+    if (!activeFileId) return;
+    setFiles(prev => prev.map(f => {
+      if (f.id !== activeFileId) return f;
+      const newPages = f.pages.map((p, i) =>
+        i === f.currentPage ? { ...p, stickerNotes: notes } : p
+      );
+      return { ...f, pages: newPages, updatedAt: Date.now() };
+    }));
+  }, [activeFileId]);
+
+  /** Called from PdfTextLayer when user selects text and clicks "Add Sticker" */
+  const handleAddStickerFromSelection = useCallback((
+    selectedText: string,
+    region: { x: number; y: number; w: number; h: number }
+  ) => {
+    if (!activeFileId) return;
+    const note: StickerNote = {
+      id: uuidv4(),
+      x: region.x + region.w + 16,
+      y: region.y,
+      text: '',
+      color: '#fef08a',
+      linkedRegion: { ...region, linkedText: selectedText },
+      createdAt: Date.now(),
+      collapsed: false,
+    };
+    setFiles(prev => prev.map(f => {
+      if (f.id !== activeFileId) return f;
+      const newPages = f.pages.map((p, i) =>
+        i === f.currentPage
+          ? { ...p, stickerNotes: [...(p.stickerNotes || []), note] }
+          : p
+      );
+      return { ...f, pages: newPages, updatedAt: Date.now() };
+    }));
+    showStatus('Sticker linked to selection! Edit it in the panel →');
+  }, [activeFileId]);
+
+  const handleAddStickerToCanvas = useCallback((note: StickerNote) => {
+    // Place a text box on the canvas at the sticker's x/y position as a visual anchor
+    if (!activeFileId) return;
+    setFiles(prev => prev.map(f => {
+      if (f.id !== activeFileId) return f;
+      const stickerTextBox = {
+        id: uuidv4(),
+        x: Math.max(10, note.x),
+        y: Math.max(10, note.y),
+        width: 200,
+        height: 120,
+        text: note.text || '📌 Sticker Note',
+        fontSize: 13,
+        fontFamily: 'Arial',
+        color: '#78350f',
+        bold: false,
+        italic: false,
+        editing: false,
+      };
+      const newPages = f.pages.map((p, i) =>
+        i === f.currentPage
+          ? { ...p, textBoxes: [...p.textBoxes, stickerTextBox] }
+          : p
+      );
+      return { ...f, pages: newPages, updatedAt: Date.now() };
+    }));
+    showStatus('Sticker placed on canvas!');
+  }, [activeFileId]);
 
   const handleUploadPdf = async (file: File) => {
     const id = uuidv4();
@@ -367,9 +429,20 @@ function App() {
     );
   }
 
-  const currentPageData = activeFile.pages[activeFile.currentPage] || emptyPage();
+  // Guard: ensure stickerNotes exists on legacy loaded pages
+  const currentPageData: PageData = {
+    ...emptyPage(),
+    ...(activeFile.pages[activeFile.currentPage] || emptyPage()),
+  };
   const pdfImages = pdfPageImages.get(activeFile.id) || [];
   const currentPdfImage = pdfImages[activeFile.currentPage] || null;
+  const currentStickerNotes = currentPageData.stickerNotes || [];
+  const isPdfMultiPage = activeFile.type === 'pdf' && activeFile.totalPages > 1;
+
+  // Flatten all sticker notes across all pages for "All Notes" tab
+  const allStickerNotes: { pageIndex: number; note: StickerNote }[] = activeFile.pages.flatMap(
+    (p, i) => (p.stickerNotes || []).map(note => ({ pageIndex: i, note }))
+  );
 
   return (
     <div className="h-screen flex flex-col bg-gray-100 overflow-hidden">
@@ -436,88 +509,124 @@ function App() {
         />
       </div>
 
-      {/* Canvas area — scrollable for PDF multi-page */}
-      <div className="flex-1 overflow-auto bg-gradient-to-br from-gray-200 to-gray-300">
-        <div className="flex flex-col items-center py-6 gap-6">
-          {activeFile.type === 'pdf' && pdfImages.length > 1 ? (
-            pdfImages.map((_, pageIdx) => {
-              const pgData = activeFile.pages[pageIdx] || emptyPage();
-              const isActivePage = activeFile.currentPage === pageIdx;
-              return (
-                <div
-                  key={pageIdx}
-                  className={`relative shadow-2xl rounded-lg overflow-hidden border-2 transition-all ${isActivePage ? 'border-blue-400' : 'border-gray-300'}`}
-                  onClick={() => handlePageChange(pageIdx)}
-                >
-                  <DrawingCanvas
-                    ref={isActivePage ? canvasRef : undefined}
-                    pageData={pgData}
-                    onPageDataChange={isActivePage ? handlePageDataChange : () => {}}
-                    activeTool={isActivePage ? (activeTool === 'pdfselect' ? 'pan' : activeTool) : 'pan'}
-                    onToolChange={setActiveTool}
-                    penColor={penColor}
-                    penWidth={penWidth}
-                    penStyle={penStyle}
-                    penOpacity={penOpacity}
-                    highlighterColor={highlighterColor}
-                    highlighterWidth={highlighterWidth}
-                    eraserMode={eraserMode}
-                    eraserWidth={eraserWidth}
-                    pdfPageImage={pdfImages[pageIdx] || null}
-                    canvasWidth={CANVAS_W}
-                    canvasHeight={CANVAS_H}
-                    zoom={zoom}
-                  />
-                  {activeFile.pdfDataUrl && (
-                    <PdfTextLayer
-                      pdfDataUrl={activeFile.pdfDataUrl}
-                      pageIndex={pageIdx}
-                      canvasWidth={CANVAS_W}
-                      canvasHeight={CANVAS_H}
-                      zoom={zoom}
-                      active={isActivePage && activeTool === 'pdfselect'}
-                    />
-                  )}
-                  <div className="absolute bottom-1 right-2 text-[10px] text-gray-400 bg-white/70 px-1.5 py-0.5 rounded">
-                    Page {pageIdx + 1}
+      {/* Main content row: canvas + sticker panel */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Canvas area — scrollable for PDF multi-page */}
+        <div className="flex-1 overflow-auto bg-gradient-to-br from-gray-200 to-gray-300">
+          <div className="flex flex-col items-center py-6 gap-6">
+            {isPdfMultiPage ? (
+              Array.from({ length: activeFile.totalPages }, (_, pageIdx) => {
+                const pgData: PageData = {
+                  ...emptyPage(),
+                  ...(activeFile.pages[pageIdx] || emptyPage()),
+                };
+                const isActivePage = activeFile.currentPage === pageIdx;
+                const cachedImg = pdfImages[pageIdx] || null;
+                return (
+                  <div
+                    key={pageIdx}
+                    className={`relative shadow-2xl rounded-lg overflow-hidden border-2 transition-all cursor-pointer ${isActivePage ? 'border-blue-400' : 'border-gray-300'}`}
+                    onClick={() => handlePageChange(pageIdx)}
+                    style={{ width: CANVAS_W * zoom, minHeight: CANVAS_H * zoom }}
+                  >
+                    {/* Lazy PDF background — only renders when scrolled into view */}
+                    {activeFile.pdfDataUrl && (
+                      <div style={{ position: 'absolute', top: 0, left: 0, width: CANVAS_W * zoom, height: CANVAS_H * zoom, zIndex: 0 }}>
+                        <LazyPdfPage
+                          pdfDataUrl={activeFile.pdfDataUrl}
+                          pageIndex={pageIdx}
+                          canvasWidth={CANVAS_W}
+                          canvasHeight={CANVAS_H}
+                          cachedImage={cachedImg}
+                          onImageReady={(pi, dataUrl) => handlePageImageReady(activeFile.id, pi, dataUrl)}
+                        />
+                      </div>
+                    )}
+                    <div style={{ position: 'relative', zIndex: 1 }}>
+                      <DrawingCanvas
+                        ref={isActivePage ? canvasRef : undefined}
+                        pageData={pgData}
+                        onPageDataChange={isActivePage ? handlePageDataChange : () => {}}
+                        activeTool={isActivePage ? (activeTool === 'pdfselect' ? 'pan' : activeTool) : 'pan'}
+                        onToolChange={setActiveTool}
+                        penColor={penColor}
+                        penWidth={penWidth}
+                        penStyle={penStyle}
+                        penOpacity={penOpacity}
+                        highlighterColor={highlighterColor}
+                        highlighterWidth={highlighterWidth}
+                        eraserMode={eraserMode}
+                        eraserWidth={eraserWidth}
+                        pdfPageImage={cachedImg}
+                        canvasWidth={CANVAS_W}
+                        canvasHeight={CANVAS_H}
+                        zoom={zoom}
+                      />
+                    </div>
+                    {activeFile.pdfDataUrl && (
+                      <PdfTextLayer
+                        pdfDataUrl={activeFile.pdfDataUrl}
+                        pageIndex={pageIdx}
+                        canvasWidth={CANVAS_W}
+                        canvasHeight={CANVAS_H}
+                        zoom={zoom}
+                        active={isActivePage && activeTool === 'pdfselect'}
+                        onAddStickerFromSelection={handleAddStickerFromSelection}
+                      />
+                    )}
+                    <div className="absolute bottom-1 right-2 text-[10px] text-gray-400 bg-white/70 px-1.5 py-0.5 rounded" style={{ zIndex: 10 }}>
+                      Page {pageIdx + 1}
+                    </div>
                   </div>
-                </div>
-              );
-            })
-          ) : (
-            <div className="relative shadow-2xl rounded-lg overflow-hidden border border-gray-300">
-              <DrawingCanvas
-                ref={canvasRef}
-                pageData={currentPageData}
-                onPageDataChange={handlePageDataChange}
-                activeTool={activeTool === 'pdfselect' ? 'pan' : activeTool}
-                onToolChange={setActiveTool}
-                penColor={penColor}
-                penWidth={penWidth}
-                penStyle={penStyle}
-                penOpacity={penOpacity}
-                highlighterColor={highlighterColor}
-                highlighterWidth={highlighterWidth}
-                eraserMode={eraserMode}
-                eraserWidth={eraserWidth}
-                pdfPageImage={currentPdfImage}
-                canvasWidth={CANVAS_W}
-                canvasHeight={CANVAS_H}
-                zoom={zoom}
-              />
-              {activeFile.pdfDataUrl && (
-                <PdfTextLayer
-                  pdfDataUrl={activeFile.pdfDataUrl}
-                  pageIndex={activeFile.currentPage}
+                );
+              })
+            ) : (
+              <div className="relative shadow-2xl rounded-lg overflow-hidden border border-gray-300">
+                <DrawingCanvas
+                  ref={canvasRef}
+                  pageData={currentPageData}
+                  onPageDataChange={handlePageDataChange}
+                  activeTool={activeTool === 'pdfselect' ? 'pan' : activeTool}
+                  onToolChange={setActiveTool}
+                  penColor={penColor}
+                  penWidth={penWidth}
+                  penStyle={penStyle}
+                  penOpacity={penOpacity}
+                  highlighterColor={highlighterColor}
+                  highlighterWidth={highlighterWidth}
+                  eraserMode={eraserMode}
+                  eraserWidth={eraserWidth}
+                  pdfPageImage={currentPdfImage}
                   canvasWidth={CANVAS_W}
                   canvasHeight={CANVAS_H}
                   zoom={zoom}
-                  active={activeTool === 'pdfselect'}
                 />
-              )}
-            </div>
-          )}
+                {activeFile.pdfDataUrl && (
+                  <PdfTextLayer
+                    pdfDataUrl={activeFile.pdfDataUrl}
+                    pageIndex={activeFile.currentPage}
+                    canvasWidth={CANVAS_W}
+                    canvasHeight={CANVAS_H}
+                    zoom={zoom}
+                    active={activeTool === 'pdfselect'}
+                    onAddStickerFromSelection={handleAddStickerFromSelection}
+                  />
+                )}
+              </div>
+            )}
+          </div>
         </div>
+
+        {/* Sticker Notes side panel */}
+        <StickerNotesPanel
+          notes={currentStickerNotes}
+          allNotes={allStickerNotes}
+          currentPageIndex={activeFile.currentPage}
+          totalPages={activeFile.totalPages}
+          onChange={handleStickerNotesChange}
+          onAddStickerToCanvas={handleAddStickerToCanvas}
+          onJumpToPage={handlePageChange}
+        />
       </div>
 
       {/* Hidden inputs */}
